@@ -326,7 +326,7 @@ button {
 // ════════════════════════════════════════════════════════════
 //  CONSTANTS & 24/7 IN-BROWSER VECTOR ENGINE
 // ════════════════════════════════════════════════════════════
-const API  = window.location.origin;
+const API  = window.location.origin + window.location.pathname.replace(/\/+$/, '');
 const DIMS = 16;
 const COL  = { cs:'#00d9ff', math:'#b388ff', food:'#ffb74d', sports:'#69f0ae', doc:'#a6e3a1', default:'#90a4ae' };
 const DIM_COL = ['#00d9ff','#00d9ff','#00d9ff','#00d9ff','#b388ff','#b388ff','#b388ff','#b388ff',
@@ -612,14 +612,17 @@ window.fetch = async function(input, init = {}) {
   const method = (init.method || 'GET').toUpperCase();
   const body = init.body ? (typeof init.body === 'string' ? JSON.parse(init.body) : init.body) : {};
 
-  // Try real backend if available
-  try {
-    const res = await _realFetch(input, init);
-    const ct = res.headers.get('content-type') || '';
-    if (res.ok && (ct.includes('application/json') || !urlStr.includes('/items'))) {
-      return res;
-    }
-  } catch (_) {}
+  // If hosted on GitHub Pages or static host, directly serve from in-browser VectorDB engine
+  const isStaticHost = window.location.hostname.endsWith('github.io') || window.location.protocol === 'file:';
+  if (!isStaticHost) {
+    try {
+      const res = await _realFetch(input, init);
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
+        return res;
+      }
+    } catch (_) {}
+  }
 
   // Seamless 24/7 In-Browser Fallback Engine
   let resData = null;
@@ -738,7 +741,11 @@ function pca2D(embs) {
 const sc=document.getElementById('scatter'), ctx=sc.getContext('2d');
 let bounds={minX:-1,maxX:1,minY:-1,maxY:1};
 
-function resize() { const r=sc.parentElement.getBoundingClientRect(); sc.width=r.width; sc.height=r.height; }
+function resize() {
+  const r = sc.parentElement ? sc.parentElement.getBoundingClientRect() : null;
+  sc.width = (r && r.width > 0) ? r.width : (window.innerWidth ? Math.max(window.innerWidth - 650, 400) : 600);
+  sc.height = (r && r.height > 0) ? r.height : (window.innerHeight ? Math.max(window.innerHeight - 60, 400) : 500);
+}
 window.addEventListener('resize', resize);
 
 function w2c(wx,wy) {
