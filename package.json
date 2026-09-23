@@ -1,0 +1,12 @@
+{
+  "name": "vectordb-server",
+  "version": "1.0.0",
+  "description": "Production Vector Database engine implementing HNSW, KD-Tree, Brute Force, and RAG pipeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["vectordb", "hnsw", "kdtree", "rag", "embeddings"],
+  "author": "",
+  "license": "MIT"
+}
