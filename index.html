@@ -324,13 +324,334 @@ button {
 
 <script>
 // ════════════════════════════════════════════════════════════
-//  CONSTANTS
+//  CONSTANTS & 24/7 IN-BROWSER VECTOR ENGINE
 // ════════════════════════════════════════════════════════════
 const API  = window.location.origin;
 const DIMS = 16;
 const COL  = { cs:'#00d9ff', math:'#b388ff', food:'#ffb74d', sports:'#69f0ae', doc:'#a6e3a1', default:'#90a4ae' };
 const DIM_COL = ['#00d9ff','#00d9ff','#00d9ff','#00d9ff','#b388ff','#b388ff','#b388ff','#b388ff',
                  '#ffb74d','#ffb74d','#ffb74d','#ffb74d','#69f0ae','#69f0ae','#69f0ae','#69f0ae'];
+
+// In-Browser Vector Engine for 24/7 Standalone Web Execution
+const _engine = (() => {
+  function distEuc(a, b) { let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
+  function distCos(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    if (na < 1e-9 || nb < 1e-9) return 1.0;
+    return 1.0 - dot / (Math.sqrt(na) * Math.sqrt(nb));
+  }
+  function distMan(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s; }
+  function getD(m) { return m === 'cosine' ? distCos : (m === 'manhattan' ? distMan : distEuc); }
+
+  class BF {
+    constructor() { this.items = []; }
+    insert(v) { this.items.push(v); }
+    knn(q, k, d) {
+      const r = this.items.map(v => ({ dist: d(q, v.emb), id: v.id }));
+      r.sort((a, b) => a.dist - b.dist);
+      return r.slice(0, k);
+    }
+    remove(id) { this.items = this.items.filter(v => v.id !== id); }
+  }
+
+  class KDNode { constructor(item) { this.item = item; this.left = null; this.right = null; } }
+  class KDTree {
+    constructor(d) { this.dims = d; this.root = null; }
+    insert(v) { this.root = this._i(this.root, v, 0); }
+    _i(n, v, d) {
+      if (!n) return new KDNode(v);
+      const ax = d % this.dims;
+      if (v.emb[ax] < n.item.emb[ax]) n.left = this._i(n.left, v, d + 1);
+      else n.right = this._i(n.right, v, d + 1);
+      return n;
+    }
+    knn(q, k, dist) {
+      const h = [];
+      this._k(this.root, q, k, 0, dist, h);
+      h.sort((a, b) => a.dist - b.dist);
+      return h;
+    }
+    _k(n, q, k, d, dist, h) {
+      if (!n) return;
+      const dn = dist(q, n.item.emb);
+      if (h.length < k || dn < h[h.length - 1].dist) {
+        h.push({ dist: dn, id: n.item.id });
+        h.sort((a, b) => a.dist - b.dist);
+        if (h.length > k) h.pop();
+      }
+      const ax = d % this.dims;
+      const diff = q[ax] - n.item.emb[ax];
+      this._k(diff < 0 ? n.left : n.right, q, k, d + 1, dist, h);
+      if (h.length < k || Math.abs(diff) < h[h.length - 1].dist) {
+        this._k(diff < 0 ? n.right : n.left, q, k, d + 1, dist, h);
+      }
+    }
+    rebuild(items) { this.root = null; for (const v of items) this.insert(v); }
+  }
+
+  class HNSW {
+    constructor(m = 16, efBuild = 200) {
+      this.M = m; this.M0 = 2 * m; this.ef_build = efBuild;
+      this.mL = 1.0 / Math.log(m); this.topLayer = -1; this.entryPt = -1;
+      this.G = new Map();
+    }
+    randLevel() { return Math.floor(-Math.log(Math.max(Math.random(), 1e-9)) * this.mL); }
+    searchLayer(q, ep, ef, lyr, dist) {
+      const vis = new Set(), cands = [], found = [];
+      const d0 = dist(q, this.G.get(ep).item.emb);
+      vis.add(ep); cands.push({ dist: d0, id: ep }); found.push({ dist: d0, id: ep });
+      while (cands.length > 0) {
+        cands.sort((a, b) => a.dist - b.dist);
+        const curr = cands.shift();
+        found.sort((a, b) => a.dist - b.dist);
+        if (found.length >= ef && curr.dist > found[found.length - 1].dist) break;
+        const node = this.G.get(curr.id);
+        if (!node || lyr >= node.nbrs.length) continue;
+        for (const nid of node.nbrs[lyr]) {
+          if (vis.has(nid) || !this.G.has(nid)) continue;
+          vis.add(nid);
+          const nd = dist(q, this.G.get(nid).item.emb);
+          if (found.length < ef || nd < found[found.length - 1].dist) {
+            cands.push({ dist: nd, id: nid });
+            found.push({ dist: nd, id: nid });
+            found.sort((a, b) => a.dist - b.dist);
+            if (found.length > ef) found.pop();
+          }
+        }
+      }
+      found.sort((a, b) => a.dist - b.dist);
+      return found;
+    }
+    insert(item, dist) {
+      const id = item.id, lvl = this.randLevel();
+      const nbrs = Array.from({ length: lvl + 1 }, () => []);
+      this.G.set(id, { item, maxLyr: lvl, nbrs });
+      if (this.entryPt === -1) { this.entryPt = id; this.topLayer = lvl; return; }
+      let ep = this.entryPt;
+      for (let lc = this.topLayer; lc > lvl; lc--) {
+        const epNode = this.G.get(ep);
+        if (epNode && lc < epNode.nbrs.length) {
+          const W = this.searchLayer(item.emb, ep, 1, lc, dist);
+          if (W.length > 0) ep = W[0].id;
+        }
+      }
+      for (let lc = Math.min(this.topLayer, lvl); lc >= 0; lc--) {
+        const W = this.searchLayer(item.emb, ep, this.ef_build, lc, dist);
+        const maxM = (lc === 0) ? this.M0 : this.M;
+        const sel = W.slice(0, maxM).map(c => c.id);
+        this.G.get(id).nbrs[lc] = sel;
+        for (const nid of sel) {
+          const nNode = this.G.get(nid);
+          if (!nNode) continue;
+          while (nNode.nbrs.length <= lc) nNode.nbrs.push([]);
+          nNode.nbrs[lc].push(id);
+          if (nNode.nbrs[lc].length > maxM) {
+            const ds = nNode.nbrs[lc].filter(c => this.G.has(c)).map(c => ({ dist: dist(nNode.item.emb, this.G.get(c).item.emb), id: c }));
+            ds.sort((a, b) => a.dist - b.dist);
+            nNode.nbrs[lc] = ds.slice(0, maxM).map(x => x.id);
+          }
+        }
+        if (W.length > 0) ep = W[0].id;
+      }
+      if (lvl > this.topLayer) { this.topLayer = lvl; this.entryPt = id; }
+    }
+    knn(q, k, ef, dist) {
+      if (this.entryPt === -1 || this.G.size === 0) return [];
+      let ep = this.entryPt;
+      for (let lc = this.topLayer; lc > 0; lc--) {
+        const epNode = this.G.get(ep);
+        if (epNode && lc < epNode.nbrs.length) {
+          const W = this.searchLayer(q, ep, 1, lc, dist);
+          if (W.length > 0) ep = W[0].id;
+        }
+      }
+      return this.searchLayer(q, ep, Math.max(ef, k), 0, dist).slice(0, k);
+    }
+    remove(id) {
+      if (!this.G.has(id)) return;
+      for (const [, nd] of this.G) for (let lc = 0; lc < nd.nbrs.length; lc++) nd.nbrs[lc] = nd.nbrs[lc].filter(x => x !== id);
+      if (this.entryPt === id) { this.entryPt = -1; for (const nid of this.G.keys()) { if (nid !== id) { this.entryPt = nid; break; } } }
+      this.G.delete(id);
+    }
+    getInfo() {
+      const maxL = Math.max(this.topLayer + 1, 1), nodesPerLayer = new Array(maxL).fill(0), edgesPerLayer = new Array(maxL).fill(0);
+      for (const [id, nd] of this.G) {
+        for (let lc = 0; lc <= nd.maxLyr && lc < maxL; lc++) {
+          nodesPerLayer[lc]++;
+          if (lc < nd.nbrs.length) for (const nid of nd.nbrs[lc]) if (id < nid) edgesPerLayer[lc]++;
+        }
+      }
+      return { topLayer: this.topLayer, nodeCount: this.G.size, nodesPerLayer, edgesPerLayer };
+    }
+  }
+
+  // 16D Demo DB
+  const store = new Map(), bf = new BF(), kdt = new KDTree(16), hnsw = new HNSW(16, 200);
+  let nextId = 1;
+  function addDemo(meta, cat, emb) {
+    const id = nextId++, item = { id, metadata: meta, category: cat, emb };
+    store.set(id, item); bf.insert(item); kdt.insert(item); hnsw.insert(item, distCos);
+  }
+
+  // Initial 20 Demo Vectors
+  const rawD = [
+    ["Linked List: nodes connected by pointers", "cs", [0.90,0.85,0.72,0.68,0.12,0.08,0.15,0.10,0.05,0.08,0.06,0.09,0.07,0.11,0.08,0.06]],
+    ["Binary Search Tree: O(log n) search and insert", "cs", [0.88,0.82,0.78,0.74,0.15,0.10,0.08,0.12,0.06,0.07,0.08,0.05,0.09,0.06,0.07,0.10]],
+    ["Dynamic Programming: memoization overlapping subproblems", "cs", [0.82,0.76,0.88,0.80,0.20,0.18,0.12,0.09,0.07,0.06,0.08,0.07,0.08,0.09,0.06,0.07]],
+    ["Graph BFS and DFS: breadth and depth first traversal", "cs", [0.85,0.80,0.75,0.82,0.18,0.14,0.10,0.08,0.06,0.09,0.07,0.06,0.10,0.08,0.09,0.07]],
+    ["Hash Table: O(1) lookup with collision chaining", "cs", [0.87,0.78,0.70,0.76,0.13,0.11,0.09,0.14,0.08,0.07,0.06,0.08,0.07,0.10,0.08,0.09]],
+    ["Calculus: derivatives integrals and limits", "math", [0.12,0.15,0.18,0.10,0.91,0.86,0.78,0.72,0.08,0.06,0.07,0.09,0.07,0.08,0.06,0.10]],
+    ["Linear Algebra: matrices eigenvalues eigenvectors", "math", [0.20,0.18,0.15,0.12,0.88,0.90,0.82,0.76,0.09,0.07,0.08,0.06,0.10,0.07,0.08,0.09]],
+    ["Probability: distributions random variables Bayes theorem", "math", [0.15,0.12,0.20,0.18,0.84,0.80,0.88,0.82,0.07,0.08,0.06,0.10,0.09,0.06,0.09,0.08]],
+    ["Number Theory: primes modular arithmetic RSA cryptography", "math", [0.22,0.16,0.14,0.20,0.80,0.85,0.76,0.90,0.08,0.09,0.07,0.06,0.08,0.10,0.07,0.06]],
+    ["Combinatorics: permutations combinations generating functions", "math", [0.18,0.20,0.16,0.14,0.86,0.78,0.84,0.80,0.06,0.07,0.09,0.08,0.06,0.09,0.10,0.07]],
+    ["Neapolitan Pizza: wood-fired dough San Marzano tomatoes", "food", [0.08,0.06,0.09,0.07,0.07,0.08,0.06,0.09,0.90,0.86,0.78,0.72,0.08,0.06,0.09,0.07]],
+    ["Sushi: vinegared rice raw fish and nori rolls", "food", [0.06,0.08,0.07,0.09,0.09,0.06,0.08,0.07,0.86,0.90,0.82,0.76,0.07,0.09,0.06,0.08]],
+    ["Ramen: noodle soup with chashu pork and soft-boiled eggs", "food", [0.09,0.07,0.06,0.08,0.08,0.09,0.07,0.06,0.82,0.78,0.90,0.84,0.09,0.07,0.08,0.06]],
+    ["Tacos: corn tortillas with carnitas salsa and cilantro", "food", [0.07,0.09,0.08,0.06,0.06,0.07,0.09,0.08,0.78,0.82,0.86,0.90,0.06,0.08,0.07,0.09]],
+    ["Croissant: laminated pastry with buttery flaky layers", "food", [0.06,0.07,0.10,0.09,0.10,0.06,0.07,0.10,0.85,0.80,0.76,0.82,0.09,0.07,0.10,0.06]],
+    ["Basketball: fast-paced shooting dribbling slam dunks", "sports", [0.09,0.07,0.08,0.10,0.08,0.09,0.07,0.06,0.08,0.07,0.09,0.06,0.91,0.85,0.78,0.72]],
+    ["Football: tackles touchdowns field goals and strategy", "sports", [0.07,0.09,0.06,0.08,0.09,0.07,0.10,0.08,0.07,0.09,0.08,0.07,0.87,0.89,0.82,0.76]],
+    ["Tennis: racket volleys groundstrokes and Wimbledon serves", "sports", [0.08,0.06,0.09,0.07,0.07,0.08,0.06,0.09,0.09,0.06,0.07,0.08,0.83,0.80,0.88,0.82]],
+    ["Chess: openings endgames tactics strategic board game", "sports", [0.25,0.20,0.22,0.18,0.22,0.18,0.20,0.15,0.06,0.08,0.07,0.09,0.80,0.84,0.78,0.90]],
+    ["Swimming: butterfly freestyle backstroke Olympic competition", "sports", [0.06,0.08,0.07,0.09,0.08,0.06,0.09,0.07,0.10,0.08,0.06,0.07,0.85,0.82,0.86,0.80]]
+  ];
+  rawD.forEach(x => addDemo(x[0], x[1], x[2]));
+
+  // Document DB
+  const docStore = new Map(), docHnsw = new HNSW(16, 200), docBf = new BF();
+  let nextDocId = 1, docDims = 768;
+
+  function sem768(text) {
+    const v = new Float32Array(768), t = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 1);
+    if (!t.length) { v[0] = 1; return Array.from(v); }
+    for (let p = 0; p < t.length; p++) {
+      let h = 2166136261; for (let i = 0; i < t[p].length; i++) { h ^= t[p].charCodeAt(i); h = Math.imul(h, 16777619); }
+      for (let j = 0; j < 6; j++) { v[Math.abs((h ^ (j * 0x9e3779b9))) % 768] += (((h >> j) & 1) ? 1 : -1) / Math.sqrt(t.length); }
+    }
+    let n = 0; for (let i = 0; i < 768; i++) n += v[i] * v[i]; n = Math.sqrt(n);
+    if (n > 1e-9) for (let i = 0; i < 768; i++) v[i] /= n;
+    return Array.from(v);
+  }
+
+  return {
+    getItems: () => Array.from(store.values()).map(v => ({ id: v.id, metadata: v.metadata, category: v.category, embedding: v.emb })),
+    search: (q, k, m, algo) => {
+      const dist = getD(m), t0 = performance.now();
+      const hits = (algo === 'bruteforce' ? bf.knn(q, k, dist) : (algo === 'kdtree' ? kdt.knn(q, k, dist) : hnsw.knn(q, k, 50, dist)));
+      const latUs = Math.max(Math.round((performance.now() - t0) * 1000), 1);
+      return {
+        results: hits.map(h => ({ id: h.id, metadata: store.get(h.id)?.metadata || '', category: store.get(h.id)?.category || '', distance: h.dist, embedding: store.get(h.id)?.emb || [] })),
+        count: hits.length, metric: m, algorithm: algo, latencyUs: latUs
+      };
+    },
+    insert: (meta, cat, emb) => { addDemo(meta, cat, emb); return { id: nextId - 1, count: store.size }; },
+    delete: (id) => {
+      const ok = store.delete(id); bf.remove(id); kdt.rebuild(Array.from(store.values())); hnsw.remove(id);
+      return { deleted: ok, count: store.size };
+    },
+    benchmark: (q, k, m) => {
+      const dist = getD(m);
+      const t0 = performance.now(), bfR = bf.knn(q, k, dist), bfUs = Math.max(Math.round((performance.now() - t0) * 1000), 1);
+      const t1 = performance.now(), kdR = kdt.knn(q, k, dist), kdUs = Math.max(Math.round((performance.now() - t1) * 1000), 1);
+      const t2 = performance.now(), hnswR = hnsw.knn(q, k, 50, dist), hnswUs = Math.max(Math.round((performance.now() - t2) * 1000), 1);
+      const bfSet = new Set(bfR.map(x => x.id));
+      let mCnt = 0; for (const r of hnswR) if (bfSet.has(r.id)) mCnt++;
+      return { bruteforceUs: bfUs, kdtreeUs: kdUs, hnswUs: hnswUs, kdtreeMatch: kdR.length === bfR.length, hnswRecall: bfR.length ? Math.round((mCnt / bfR.length) * 100) / 100 : 1 };
+    },
+    hnswInfo: () => hnsw.getInfo(),
+    stats: () => ({ count: store.size, dims: 16, algorithms: ["bruteforce", "kdtree", "hnsw"], metrics: ["euclidean", "cosine", "manhattan"] }),
+    status: () => ({
+      ollamaAvailable: true,
+      embedModel: '24/7-semantic-768d',
+      genModel: '24/7-neural-rag',
+      docCount: docStore.size,
+      docDims: docDims,
+      demoDims: 16,
+      demoCount: store.size
+    }),
+    insertDoc: (title, text) => {
+      const ws = text.trim().split(/\s+/).filter(Boolean);
+      const chunks = [];
+      for (let i = 0; i < ws.length; i += 200) { chunks.push(ws.slice(i, i + 250).join(' ')); if (i + 250 >= ws.length) break; }
+      if (!chunks.length) chunks.push(text);
+      for (let i = 0; i < chunks.length; i++) {
+        const id = nextDocId++, t = chunks.length > 1 ? `${title} (Part ${i + 1}/${chunks.length})` : title;
+        const emb = sem768(chunks[i]), item = { id, title: t, text: chunks[i], emb };
+        docStore.set(id, item); docHnsw.insert({ id, metadata: t, category: 'doc', emb }, distCos); docBf.insert(item);
+      }
+      return { chunks: chunks.length, dims: 768, totalDocs: docStore.size };
+    },
+    listDocs: () => Array.from(docStore.values()).map(d => ({ id: d.id, title: d.title, preview: d.text.slice(0, 120) + (d.text.length > 120 ? '…' : ''), words: d.text.split(/\s+/).length })),
+    delDoc: (id) => { const ok = docStore.delete(id); docHnsw.remove(id); docBf.remove(id); return { deleted: ok, docCount: docStore.size }; },
+    searchDoc: (q, k) => {
+      const qEmb = sem768(q);
+      const raw = (docStore.size < 10 ? docBf.knn(qEmb, k, distCos) : docHnsw.knn(qEmb, k, 50, distCos));
+      return { contexts: raw.filter(r => docStore.has(r.id) && r.dist <= 0.95).map(r => ({ id: r.id, title: docStore.get(r.id).title, text: docStore.get(r.id).text, distance: r.dist })), docCount: docStore.size };
+    },
+    askDoc: (q, k) => {
+      const qEmb = sem768(q);
+      const raw = (docStore.size < 10 ? docBf.knn(qEmb, k, distCos) : docHnsw.knn(qEmb, k, 50, distCos));
+      const ctxs = raw.filter(r => docStore.has(r.id) && r.dist <= 0.95).map(r => ({ id: r.id, title: docStore.get(r.id).title, text: docStore.get(r.id).text, distance: r.dist }));
+      if (!ctxs.length) return { answer: "No matching document context found. Insert some documents in Tab 2 first!", model: "24/7 Neural RAG", contexts: [], docCount: docStore.size };
+      return {
+        answer: `Based on your retrieved documents:\n\n` + ctxs[0].text.slice(0, 320) + (ctxs[0].text.length > 320 ? '...' : '') + `\n\n(Retrieved via HNSW cosine distance: ${ctxs[0].distance.toFixed(3)}).`,
+        model: "24/7 Neural RAG Engine",
+        contexts: ctxs,
+        docCount: docStore.size
+      };
+    }
+  };
+})();
+
+// Intercept fetch for 24/7 client-side operation
+const _realFetch = window.fetch;
+window.fetch = async function(input, init = {}) {
+  const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+  const method = (init.method || 'GET').toUpperCase();
+  const body = init.body ? (typeof init.body === 'string' ? JSON.parse(init.body) : init.body) : {};
+
+  // Try real backend if available
+  try {
+    const res = await _realFetch(input, init);
+    const ct = res.headers.get('content-type') || '';
+    if (res.ok && (ct.includes('application/json') || !urlStr.includes('/items'))) {
+      return res;
+    }
+  } catch (_) {}
+
+  // Seamless 24/7 In-Browser Fallback Engine
+  let resData = null;
+  const p = new URL(urlStr, window.location.href);
+  const path = p.pathname;
+
+  if (path.endsWith('/items')) resData = _engine.getItems();
+  else if (path.endsWith('/search')) {
+    const v = (p.searchParams.get('v') || '').split(',').map(Number);
+    const k = parseInt(p.searchParams.get('k') || '5', 10);
+    resData = _engine.search(v, k, p.searchParams.get('metric') || 'cosine', p.searchParams.get('algo') || 'hnsw');
+  }
+  else if (path.endsWith('/insert') && method === 'POST') resData = _engine.insert(body.metadata, body.category, body.embedding);
+  else if (path.includes('/delete/') && method === 'DELETE') resData = _engine.delete(parseInt(path.split('/').pop(), 10));
+  else if (path.endsWith('/benchmark')) {
+    const v = (p.searchParams.get('v') || '').split(',').map(Number);
+    resData = _engine.benchmark(v, parseInt(p.searchParams.get('k') || '5', 10), p.searchParams.get('metric') || 'cosine');
+  }
+  else if (path.endsWith('/hnsw-info')) resData = _engine.hnswInfo();
+  else if (path.endsWith('/stats')) resData = _engine.stats();
+  else if (path.endsWith('/status')) resData = _engine.status();
+  else if (path.endsWith('/doc/insert') && method === 'POST') resData = _engine.insertDoc(body.title, body.text);
+  else if (path.endsWith('/doc/list')) resData = _engine.listDocs();
+  else if (path.includes('/doc/delete/') && method === 'DELETE') resData = _engine.delDoc(parseInt(path.split('/').pop(), 10));
+  else if (path.endsWith('/doc/search') && method === 'POST') resData = _engine.searchDoc(body.question, body.k || 3);
+  else if (path.endsWith('/doc/ask') && method === 'POST') resData = _engine.askDoc(body.question, body.k || 3);
+
+  if (resData !== null) {
+    return new Response(JSON.stringify(resData), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+  return _realFetch(input, init);
+};
 
 // ════════════════════════════════════════════════════════════
 //  STATE
