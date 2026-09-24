@@ -610,7 +610,14 @@ const _realFetch = window.fetch;
 window.fetch = async function(input, init = {}) {
   const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
   const method = (init.method || 'GET').toUpperCase();
-  const body = init.body ? (typeof init.body === 'string' ? JSON.parse(init.body) : init.body) : {};
+  let body = {};
+  if (init && init.body) {
+    try {
+      body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body;
+    } catch (_) {
+      body = {};
+    }
+  }
 
   // If hosted on GitHub Pages or static host, directly serve from in-browser VectorDB engine
   const isStaticHost = window.location.hostname.endsWith('github.io') || window.location.protocol === 'file:';
@@ -626,29 +633,36 @@ window.fetch = async function(input, init = {}) {
 
   // Seamless 24/7 In-Browser Fallback Engine
   let resData = null;
-  const p = new URL(urlStr, window.location.href);
-  const path = p.pathname;
+  try {
+    const p = new URL(urlStr, window.location.href);
+    const path = p.pathname;
 
-  if (path.endsWith('/items')) resData = _engine.getItems();
-  else if (path.endsWith('/search')) {
-    const v = (p.searchParams.get('v') || '').split(',').map(Number);
-    const k = parseInt(p.searchParams.get('k') || '5', 10);
-    resData = _engine.search(v, k, p.searchParams.get('metric') || 'cosine', p.searchParams.get('algo') || 'hnsw');
+    // Handle doc-specific routes FIRST to avoid collision with generic /insert, /search, /delete
+    if (path.endsWith('/doc/insert') && method === 'POST') resData = _engine.insertDoc(body.title, body.text);
+    else if (path.endsWith('/doc/list')) resData = _engine.listDocs();
+    else if (path.includes('/doc/delete/') && method === 'DELETE') resData = _engine.delDoc(parseInt(path.split('/').pop(), 10));
+    else if (path.endsWith('/doc/search') && method === 'POST') resData = _engine.searchDoc(body.question, body.k || 3);
+    else if (path.endsWith('/doc/ask') && method === 'POST') resData = _engine.askDoc(body.question, body.k || 3);
+    // Generic Vector DB routes
+    else if (path.endsWith('/items')) resData = _engine.getItems();
+    else if (path.endsWith('/search')) {
+      const v = (p.searchParams.get('v') || '').split(',').map(Number);
+      const k = parseInt(p.searchParams.get('k') || '5', 10);
+      resData = _engine.search(v, k, p.searchParams.get('metric') || 'cosine', p.searchParams.get('algo') || 'hnsw');
+    }
+    else if (path.endsWith('/insert') && method === 'POST') resData = _engine.insert(body.metadata, body.category, body.embedding);
+    else if (path.includes('/delete/') && method === 'DELETE') resData = _engine.delete(parseInt(path.split('/').pop(), 10));
+    else if (path.endsWith('/benchmark')) {
+      const v = (p.searchParams.get('v') || '').split(',').map(Number);
+      resData = _engine.benchmark(v, parseInt(p.searchParams.get('k') || '5', 10), p.searchParams.get('metric') || 'cosine');
+    }
+    else if (path.endsWith('/hnsw-info')) resData = _engine.hnswInfo();
+    else if (path.endsWith('/stats')) resData = _engine.stats();
+    else if (path.endsWith('/status')) resData = _engine.status();
+  } catch (err) {
+    console.error('[VectorDB Engine Error]:', err);
+    resData = { error: err.message || 'VectorDB engine error' };
   }
-  else if (path.endsWith('/insert') && method === 'POST') resData = _engine.insert(body.metadata, body.category, body.embedding);
-  else if (path.includes('/delete/') && method === 'DELETE') resData = _engine.delete(parseInt(path.split('/').pop(), 10));
-  else if (path.endsWith('/benchmark')) {
-    const v = (p.searchParams.get('v') || '').split(',').map(Number);
-    resData = _engine.benchmark(v, parseInt(p.searchParams.get('k') || '5', 10), p.searchParams.get('metric') || 'cosine');
-  }
-  else if (path.endsWith('/hnsw-info')) resData = _engine.hnswInfo();
-  else if (path.endsWith('/stats')) resData = _engine.stats();
-  else if (path.endsWith('/status')) resData = _engine.status();
-  else if (path.endsWith('/doc/insert') && method === 'POST') resData = _engine.insertDoc(body.title, body.text);
-  else if (path.endsWith('/doc/list')) resData = _engine.listDocs();
-  else if (path.includes('/doc/delete/') && method === 'DELETE') resData = _engine.delDoc(parseInt(path.split('/').pop(), 10));
-  else if (path.endsWith('/doc/search') && method === 'POST') resData = _engine.searchDoc(body.question, body.k || 3);
-  else if (path.endsWith('/doc/ask') && method === 'POST') resData = _engine.askDoc(body.question, body.k || 3);
 
   if (resData !== null) {
     return new Response(JSON.stringify(resData), { status: 200, headers: { 'Content-Type': 'application/json' } });
